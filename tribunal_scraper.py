@@ -1,32 +1,28 @@
 """
 Tribunal order scraper (open sites only: no CAPTCHA, no login). Follows "Tribunal Data Plan" sections 4, 5, 7 and 8.
 
-Sources (default: the two free ones):
+Sources (free, official):
   nclat      NCLAT judgments/orders, by order date   (nclat.nic.in/display-board/judge)
   ibbi_nclt  NCLT IBC orders mirrored by IBBI        (ibbi.gov.in/en/orders/nclt)
-  ik_<type>  Indian Kanoon API, paid, needs IK_API_TOKEN: ik_itat, ik_cegat (CESTAT), ik_consumer, ik_cat,
-             ik_sebisat (SAT), ik_tdsat, ik_drat, ik_cci, ik_cic, ik_greentribunal (NGT), ik_aptel, ik_cerc
 
 Not scraped on purpose: NCLT site, ITAT, CESTAT, NGT (CAPTCHA on search); APTEL site (diary-number search only).
 
 Each order: text (PDF text, else OCR in English + Hindi), parsed fields, checks, masking, then enrich.py
-(acts and sections, citations, tribunal-specific fields, and with --summarize an AI summary via Claude).
+(acts and sections, citations, IBC fields). Everything runs free: no paid APIs.
 
 Output folder (--out), plan section 5 layout:
-  raw/{TRIBUNAL}/{yyyy}/{mm}/{order_uid}.pdf|html  original file, never edited
-  text/{TRIBUNAL}/{yyyy}/{mm}/{order_uid}.txt      cleaned + masked text
-  json/{TRIBUNAL}/{yyyy}/{mm}/{order_uid}.json     the full record (schema_version 1.0)
-  index.jsonl          one line per saved order (resume point + duplicate checks)
-  runs.jsonl           one line per site per run (plan's scrape_runs)
-  order_sources.jsonl  extra sources of an order already saved from another source
-  alerts.jsonl         alerts (also sent to ALERT_WEBHOOK_URL if set)
+  raw/{TRIBUNAL}/{yyyy}/{mm}/{order_uid}.pdf    original file, never edited
+  text/{TRIBUNAL}/{yyyy}/{mm}/{order_uid}.txt   cleaned + masked text
+  json/{TRIBUNAL}/{yyyy}/{mm}/{order_uid}.json  the full record (schema_version 1.0)
+  index.jsonl   one line per saved order (resume point + duplicate checks)
+  runs.jsonl    one line per site per run (plan's scrape_runs)
+  alerts.jsonl  alerts (also sent to ALERT_WEBHOOK_URL if set)
 Records that fail a check are still saved, with status "flagged"; review them with review.py.
 
 Usage:
   python tribunal_scraper.py --trial                      # print what it finds, save nothing
   python tribunal_scraper.py --out "G:/My Drive/tribunals" --from 2026-10-01 --to 2026-11-04
   python tribunal_scraper.py --out "G:/My Drive/tribunals" --watch 6   # re-run every 6 h while the PC is on
-  python tribunal_scraper.py --out "G:/My Drive/tribunals" --sources ik_itat ik_cegat --from 2015-01-01 --summarize
 """
 import argparse, datetime as dt, hashlib, json, os, re, sys, time, unicodedata
 from collections import Counter
@@ -41,21 +37,12 @@ import pymupdf as fitz
 
 import enrich
 
-try:
-    import anthropic  # only needed with --summarize
-except ImportError:
-    anthropic = None
-
 SCHEMA_VERSION = "1.0"
 UA = "LawgicHubBot/0.1 (tribunal order indexing)"  # add a work contact address here once you have one
 DELAY = 3.0          # seconds between requests to the same site
 MAX_FAILS = 5        # consecutive failures before we stop hitting a site
 LOOKBACK_DAYS = 14   # sites upload orders ~a week late, so each run re-checks the last 2 weeks
-TRIBUNAL_START = {  # earliest possible order date per tribunal (an earlier date = parsing error)
-    "NCLT": dt.date(2016, 6, 1), "NCLAT": dt.date(2016, 6, 1), "ITAT": dt.date(1941, 1, 25), "CESTAT": dt.date(1982, 10, 11),
-    "CONSUMER": dt.date(1987, 1, 1), "CAT": dt.date(1985, 11, 1), "SAT": dt.date(1995, 1, 1), "TDSAT": dt.date(2000, 5, 1),
-    "DRAT": dt.date(1994, 1, 1), "CCI": dt.date(2009, 5, 1), "CIC": dt.date(2005, 10, 12), "NGT": dt.date(2010, 10, 18),
-    "APTEL": dt.date(2005, 4, 7), "CERC": dt.date(1998, 7, 24)}
+TRIBUNAL_START = {"NCLT": dt.date(2016, 6, 1), "NCLAT": dt.date(2016, 6, 1)}  # both constituted 1 June 2016
 
 
 class SiteDown(Exception):
@@ -71,12 +58,8 @@ class Polite:
         self.last = 0.0
         self.fails = 0
         self.robots = {}
-        self.delay = DELAY
-        self.use_robots = True
 
     def allowed(self, url):
-        if not self.use_robots:
-            return True
         host = "{0.scheme}://{0.netloc}".format(urlsplit(url))
         if host not in self.robots:
             rp = RobotFileParser()
@@ -98,7 +81,7 @@ class Polite:
         if not self.allowed(url):
             raise SiteDown(f"robots.txt disallows {url}")
         while True:
-            wait = self.last + self.delay - time.time()
+            wait = self.last + DELAY - time.time()
             if wait > 0:
                 time.sleep(wait)
             self.last = time.time()
@@ -254,7 +237,7 @@ def validate(rec):
 NCLAT = "https://nclat.nic.in/display-board/"
 
 
-def nclat_orders(http, date_from, date_to, known=()):
+def nclat_orders(http, date_from, date_to):
     page = BeautifulSoup(http.req("GET", NCLAT + "judge").text, "lxml")
     form = page.find("form", id="FormId")
     if not form:
@@ -319,7 +302,7 @@ def nclat_orders(http, date_from, date_to, known=()):
 IBBI = "https://ibbi.gov.in/en/orders/nclt"
 
 
-def ibbi_orders(http, date_from, date_to, known=(), max_pages=200):
+def ibbi_orders(http, date_from, date_to, max_pages=200):
     for p in range(1, max_pages + 1):
         soup = BeautifulSoup(http.req("GET", IBBI, params={"page": p}).text, "lxml")
         rows = [tr for tr in soup.select("table tr") if tr.find("td")]
@@ -497,85 +480,8 @@ def nclt_header(rec, text):
     return rec
 
 
-# ---------------- Indian Kanoon API (paid; ITAT, CESTAT, consumer and others) ----------------
-IK_API = "https://api.indiankanoon.org"
-IK_TYPES = {  # Indian Kanoon doctype -> our tribunal code
-    "itat": "ITAT", "cegat": "CESTAT", "consumer": "CONSUMER", "cat": "CAT", "sebisat": "SAT", "tdsat": "TDSAT",
-    "drat": "DRAT", "cci": "CCI", "cic": "CIC", "greentribunal": "NGT", "aptel": "APTEL", "cerc": "CERC"}
-IK_DATE = re.compile(r"\s+on\s+(\d{1,2})\s+([A-Za-z]+),?\s+(\d{4})\s*$")
-
-
-def ik_record(code, hit, doc):
-    """Turns one Indian Kanoon search hit + /doc/ response into our record. Raises ValueError if there is no usable date."""
-    tid = str(hit.get("tid") or doc.get("tid"))
-    html = doc.get("doc") or ""
-    soup = BeautifulSoup(html, "lxml")
-    text = clean_pages([soup.get_text("\n")])
-    title = BeautifulSoup(doc.get("title") or hit.get("title") or "", "lxml").get_text(" ", strip=True)
-    m = IK_DATE.search(title)  # IK titles end with "on 18 June, 2025"
-    try:
-        date = dt.date.fromisoformat(str(doc.get("publishdate") or hit.get("publishdate"))[:10])
-    except ValueError:
-        if not m:
-            raise ValueError(f"no order date in {title!r}")
-        date = dt.datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y").date()
-    names = IK_DATE.sub("", title).strip()
-    parties = parties_from(names, "appellant", "respondent")
-    cm = CASE.search(text[:2000])
-    source = re.sub(r"<[^>]+>", "", doc.get("docsource") or hit.get("docsource") or "").strip()
-    bench_el = soup.select_one(".doc_bench")
-    members = [{"name": n.strip(" .,"), "designation": None}
-               for n in re.split(r",|\band\b", re.sub(r"^\s*Bench:\s*", "", bench_el.get_text(" ", strip=True)) if bench_el else "")
-               if len(n.strip(" .,")) > 2]
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "tribunal_code": code,
-        "bench": source.split(" - ", 1)[1] if " - " in source else (source or None),
-        "case_number": cm.group(0).strip() if cm else names,
-        "case_number_norm": case_norm(cm.group(0)) if cm else None,
-        "case_type": re.sub(r"\s+", " ", cm.group(1)).strip() if cm else None,
-        "order_date": date.isoformat(),
-        "order_type": "final",  # IK publishes final orders/judgments
-        "title": title_from(parties) or names,
-        "parties": parties,
-        "members": members,
-        "language": "en",
-        "source": {"name": "indiankanoon_api", "page_url": f"https://indiankanoon.org/doc/{tid}/", "pdf_url": None,
-                   "ik_tid": tid, "docsource": source, "attribution_required": True},  # IK terms: show their logo with this data
-        "_text": text,
-        "_pdf": ("RAW", html.encode("utf-8"), "html"),
-    }
-
-
-def ik_orders(doctype, http, date_from, date_to, known=()):
-    token = os.environ.get("IK_API_TOKEN")
-    if not token:
-        raise SiteDown("set IK_API_TOKEN to use the Indian Kanoon API (paid, Rs 0.50/search page + Rs 0.20/document)")
-    http.s.headers.update({"Authorization": f"Token {token}", "Accept": "application/json"})
-    http.delay, http.use_robots = 1.0, False  # a paid API meant for programmatic use, not a crawl of their site
-    query = f"doctypes:{doctype} fromdate:{date_from.day}-{date_from.month}-{date_from.year} todate:{date_to.day}-{date_to.month}-{date_to.year}"
-    for page in range(1000):
-        docs = http.req("POST", f"{IK_API}/search/", params={"formInput": query, "pagenum": page}).json().get("docs") or []
-        if not docs:
-            return
-        for hit in docs:
-            tid = str(hit.get("tid"))
-            if f"indiankanoon_api:{tid}" in known:
-                yield {"_skip": tid}  # already saved: don't pay for the document again
-                continue
-            doc = http.req("POST", f"{IK_API}/doc/{tid}/").json()
-            try:
-                yield ik_record(IK_TYPES[doctype], hit, doc)
-            except (ValueError, KeyError, TypeError) as e:
-                yield {"_error": f"ik doc {tid}: {e}"}
-
-
 SOURCES = {"nclat": nclat_orders, "ibbi_nclt": ibbi_orders}
 SOURCE_TRIBUNAL = {"nclat": "NCLAT", "ibbi_nclt": "NCLT"}
-for _dt, _code in IK_TYPES.items():
-    SOURCES[f"ik_{_dt}"] = (lambda d: lambda http, a, b, known=(): ik_orders(d, http, a, b, known))(_dt)
-    SOURCE_TRIBUNAL[f"ik_{_dt}"] = _code
-FREE_SOURCES = ["nclat", "ibbi_nclt"]  # the default; Indian Kanoon sources cost money, so they run only when named
 
 
 # ---------------- PDF text + OCR ----------------
@@ -632,33 +538,12 @@ def alert(message, out=None):
             print(f"  ! could not send alert: {e}", file=sys.stderr)
 
 
-_summary_off = False
-
-
-def add_summary(rec):
-    """AI summary via Claude; a failure never blocks saving the order."""
-    global _summary_off
-    if _summary_off:
-        return
-    try:
-        rec["summary"] = enrich.summarize(rec)
-    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
-        _summary_off = True
-        print(f"  ! summaries turned off for this run (Claude API credentials): {e}", file=sys.stderr)
-    except anthropic.APIError as e:
-        print(f"  ! summary failed for {rec['case_number']}: {e}", file=sys.stderr)
-
-
-def save_order(http, rec, req, out, index, by_text, by_file, summarize=False):
-    if req[0] == "RAW":  # Indian Kanoon: the document came with the listing, as HTML
-        _, data, ext = req
-        text, pages, how = rec.pop("_text"), None, "html"
-    else:
-        method, url, form = req
-        data, ext = http.req(method, url, data=form).content, "pdf"
-        if not data.startswith(b"%PDF"):
-            raise ValueError("download is not a PDF")
-        text, pages, how = pdf_text(data)
+def save_order(http, rec, req, out, index, by_text, by_file):
+    method, url, form = req
+    data = http.req(method, url, data=form).content
+    if not data.startswith(b"%PDF"):
+        raise ValueError("download is not a PDF")
+    text, pages, how = pdf_text(data)
     if rec["tribunal_code"] == "NCLT":
         nclt_header(rec, text)  # before masking, so numbers in the header are intact
     text = mask(text)
@@ -666,15 +551,13 @@ def save_order(http, rec, req, out, index, by_text, by_file, summarize=False):
     rel = f"{rec['tribunal_code']}/{rec['order_date'][:4]}/{rec['order_date'][5:7]}/{uid}"
     raw_path = by_file.get(sha)  # same file already saved under another order: don't store it twice
     if not raw_path:
-        raw_path = f"raw/{rel}.{ext}"
+        raw_path = f"raw/{rel}.pdf"
         (out / raw_path).parent.mkdir(parents=True, exist_ok=True)
         (out / raw_path).write_bytes(data)
     chash = hashlib.sha256(text.encode()).hexdigest()
     rec.update(full_text=text, text_method=how, page_count=pages, content_hash=chash, language=detect_language(text))
     rec["source"].update(fetched_at=now(), file_sha256=sha, raw_path=raw_path)
     enrich.enrich(rec, text)
-    if summarize:
-        add_summary(rec)
     flags = validate(rec)
     if len(text) >= 300 and chash in by_text:
         flags.append(f"same_text_as:{by_text[chash]}")  # plan: same text under another identity = case no. likely parsed wrong
@@ -684,18 +567,13 @@ def save_order(http, rec, req, out, index, by_text, by_file, summarize=False):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body, encoding="utf-8")
     entry = {"order_uid": uid, "content_hash": chash, "file_sha256": sha, "raw_path": raw_path, "json_path": f"json/{rel}.json",
-             "status": rec["status"], "source": rec["source"]["name"], "source_key": source_key(rec)}
+             "status": rec["status"], "source": rec["source"]["name"]}
     with (out / "index.jsonl").open("a", encoding="utf-8") as fh:  # written last = commit point; a crash before this just redoes the order
         fh.write(json.dumps(entry) + "\n")
     index[uid] = entry
     by_text.setdefault(chash, uid)
     by_file.setdefault(sha, raw_path)
     return rec
-
-
-def source_key(rec):
-    s = rec["source"]
-    return f"{s['name']}:{s.get('ik_tid') or s.get('pdf_url') or s.get('filing_no')}"
 
 
 def load_index(out):
@@ -716,7 +594,6 @@ def run(args):
         index = load_index(out)
     by_text = {e["content_hash"]: u for u, e in index.items()}
     by_file = {e["file_sha256"]: e["raw_path"] for e in index.values()}
-    known = {e.get("source_key") for e in index.values()}
     run_type = "backfill" if (args.date_to - args.date_from).days > LOOKBACK_DAYS else "daily"
 
     for name in args.sources:
@@ -726,14 +603,10 @@ def run(args):
                "found": 0, "inserted": 0, "flagged": 0, "skipped": 0, "failed": 0, "error": None}
         print(f"== {name} {args.date_from} .. {args.date_to}")
         try:
-            for rec in SOURCES[name](http, args.date_from, args.date_to, known):
+            for rec in SOURCES[name](http, args.date_from, args.date_to):
                 if "_error" in rec:
                     log["failed"] += 1
                     print(f"  ! skipped row: {rec['_error']}", file=sys.stderr)
-                    continue
-                if "_skip" in rec:
-                    log["found"] += 1
-                    log["skipped"] += 1
                     continue
                 log["found"] += 1
                 rec["order_uid"] = order_uid(rec)
@@ -742,44 +615,31 @@ def run(args):
                     print(f"  {rec['order_date']} {rec['order_type']:<7} {str(rec['case_number_norm'] or '?? ' + rec['case_number'])[:42]:<42} "
                           f"{len(rec['parties'])} parties  {rec['title'][:50]}")
                     if log["found"] == 1:  # prove download + text + checks once, in memory only
-                        if req[0] == "RAW":
-                            text, pages, how = rec.pop("_text"), None, "html"
-                        else:
-                            method, url, form = req
-                            text, pages, how = pdf_text(http.req(method, url, data=form).content)
+                        method, url, form = req
+                        text, pages, how = pdf_text(http.req(method, url, data=form).content)
                         if rec["tribunal_code"] == "NCLT":
                             nclt_header(rec, text)
                         rec.update(full_text=mask(text), text_method=how, language=detect_language(text))
                         enrich.enrich(rec, text)
-                        if args.summarize:
-                            add_summary(rec)
                         print(f"     -> from text: {rec['case_number_norm']} | {rec['bench']} | {rec['title'][:70]} | "
                               f"{[m['name'] for m in rec['members']]}")
                         print(f"     -> {how}: {pages} pages, {len(text)} chars, lang={rec['language']}; "
                               f"acts={[p['act'][:30] + ' s.' + p['section'] for p in rec['provisions'][:4]]}; extra={rec['extra']}; "
                               f"flags={validate(rec) or 'none'}")
-                        if rec.get("summary"):
-                            print(f"     -> summary: {rec['summary'][:300]}")
                     if log["found"] >= args.trial_limit:
                         break
                     continue
                 if rec["order_uid"] in index:
                     log["skipped"] += 1
-                    if index[rec["order_uid"]].get("source") != rec["source"]["name"]:
-                        # plan: same order from a second source -> one order, extra source row (official text stays main)
-                        with (out / "order_sources.jsonl").open("a", encoding="utf-8") as fh:
-                            fh.write(json.dumps({"order_uid": rec["order_uid"], "source_name": rec["source"]["name"],
-                                                 "source_url": rec["source"]["page_url"], "fetched_at": now()}) + "\n")
                     continue
                 try:
-                    rec = save_order(http, rec, req, out, index, by_text, by_file, args.summarize)
+                    rec = save_order(http, rec, req, out, index, by_text, by_file)
                 except SiteDown:
                     raise
                 except Exception as e:  # one broken order must not stop the run
                     log["failed"] += 1
                     print(f"  ! {rec['case_number']} {rec['order_date']}: {e!r}", file=sys.stderr)
                     continue
-                known.add(source_key(rec))
                 log["inserted"] += 1
                 log["flagged"] += rec["status"] == "flagged"
         except SiteDown as e:
@@ -808,18 +668,14 @@ def main():
     today = dt.date.today()
     ap.add_argument("--from", dest="date_from", type=dt.date.fromisoformat, default=today - dt.timedelta(days=LOOKBACK_DAYS))
     ap.add_argument("--to", dest="date_to", type=dt.date.fromisoformat, default=today)
-    ap.add_argument("--sources", nargs="+", default=FREE_SOURCES, choices=list(SOURCES),
-                    help="default: the free official sites. ik_* = Indian Kanoon API (paid, needs IK_API_TOKEN)")
+    ap.add_argument("--sources", nargs="+", default=list(SOURCES), choices=list(SOURCES))
     ap.add_argument("--out", help="folder for PDFs, text, JSON and logs (e.g. your Google Drive folder)")
     ap.add_argument("--trial", action="store_true", help="print only, save nothing")
     ap.add_argument("--trial-limit", type=int, default=10)
-    ap.add_argument("--summarize", action="store_true", help=f"add an AI summary per order via Claude ({enrich.SUMMARY_MODEL}; paid)")
     ap.add_argument("--watch", type=float, help="repeat every N hours (last LOOKBACK_DAYS days each time)")
     args = ap.parse_args()
     if not args.trial and not args.out:
         ap.error("give --out FOLDER, or use --trial")
-    if args.summarize and anthropic is None:
-        ap.error("--summarize needs the Anthropic SDK: pip install anthropic")
     while True:
         run(args)
         if not args.watch:

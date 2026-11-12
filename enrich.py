@@ -1,8 +1,8 @@
 """
-Enrich step (plan section 7): acts and sections, citations, tribunal-specific fields, AI summary.
-Pure text rules except summarize(), which calls the Claude API (only when the scraper runs with --summarize).
+Enrich step (plan section 7): acts and sections, citations, NCLT/NCLAT fields.
+Pure text rules: no paid APIs.
 """
-import os, re, sys
+import re
 
 # ---------------- acts and sections ----------------
 IBC = "Insolvency and Bankruptcy Code, 2016"
@@ -84,9 +84,6 @@ def citations(text):
 
 
 # ---------------- tribunal-specific fields (plan section 4, "extra") ----------------
-REVENUE = re.compile(r"\b(ITO|DCIT|ACIT|JCIT|Addl\.?\s*CIT|CIT|Pr\.?\s*CIT|PCIT|Income[- ]tax Officer|Commissioner of Income|Revenue)\b", re.I)
-
-
 def _last_word(text, words):
     """Which of `words` appears last in the order's closing part (the operative order)."""
     tail = text[-3000:].lower()
@@ -95,9 +92,8 @@ def _last_word(text, words):
 
 
 def extra_fields(rec, text, provs):
-    code, ex = rec["tribunal_code"], {}
-    head = text[:4000]
-    if code in ("NCLT", "NCLAT"):
+    ex = {}
+    if rec["tribunal_code"] in ("NCLT", "NCLAT"):
         ibc = [re.match(r"\d+[A-Z]?", p["section"]).group(0) for p in provs if p["act"] == IBC]
         filing = [s for s in ibc if s in ("7", "9", "10", "94", "95", "54C")]  # sections a case is filed under beat definitions (s.5)
         if ibc:
@@ -112,40 +108,6 @@ def extra_fields(rec, text, provs):
         outcome = _last_word(text, ["admitted", "dismissed", "withdrawn", "allowed", "approved", "disposed of", "rejected"])
         if outcome:
             ex["outcome"] = outcome.replace(" of", "")
-    elif code == "ITAT":
-        m = re.search(r"(?:A\.?\s*Y\.?|Assessment\s+Years?)\s*[:.\-]?\s*(\d{4})\s*[-–]\s*(\d{2,4})", head, re.I)
-        if m:
-            ex["assessment_year"] = f"{m.group(1)}-{m.group(2)[-2:]}"
-        first = (rec.get("parties") or [{}])[0].get("name", "")
-        if first:
-            ex["appeal_by"] = "revenue" if REVENUE.search(first) else "assessee"
-        it = [p["section"] for p in provs if "income" in p["act"].lower() and "tax" in p["act"].lower()]
-        if it:
-            ex["section_in_dispute"] = it[0]
-    elif code == "CESTAT":
-        m = re.search(r"Final\s+Order\s+No\.?\s*:?\s*([\w/\-.]+(?:\s*/\s*\d{4})?)", text, re.I)
-        if m:
-            ex["final_order_no"] = m.group(1).strip(" .")
-        m = re.search(r"\b(Customs|Central Excise|Excise|Service Tax)\b", head, re.I)
-        if m:
-            ex["tax_type"] = {"central excise": "excise"}.get(m.group(1).lower(), m.group(1).lower())
-        m = re.search(r"Order[- ]in[- ](?:Original|Appeal)\s+No\.?\s*:?\s*([\w/\-.]+)", head, re.I)
-        if m:
-            ex["order_in_appeal_no"] = m.group(1).strip(" .")
-    elif code == "CONSUMER":
-        src = (rec.get("bench") or "") + " " + head[:600]
-        level = re.search(r"\b(National|State|District)\b", src, re.I)
-        if level:
-            ex["commission_level"] = level.group(1).lower()
-        if rec.get("bench") and " - " in rec["bench"]:
-            ex["state"] = rec["bench"].split(" - ", 1)[1]
-    elif code == "NGT":
-        m = re.search(r"(Principal Bench|(?:Southern|Western|Eastern|Central) Zon(?:e|al Bench))", head, re.I)
-        if m:
-            ex["zone"] = m.group(1).title()
-        m = re.search(r"Original\s+Application\s+No\.?\s*([\d/]+(?:\s*of\s*\d{4})?)", head, re.I)
-        if m:
-            ex["original_application_no"] = m.group(1)
     return ex
 
 
@@ -156,43 +118,6 @@ def enrich(rec, text):
     rec["citations"] = citations(text)
     rec["extra"] = {**rec.get("extra", {}), **extra_fields(rec, text, provs)}
     return rec
-
-
-# ---------------- AI summary (Claude API) ----------------
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-opus-5-5")
-SUMMARY_SYSTEM = (
-    "You write short case summaries of Indian tribunal orders for practising lawyers. "
-    "Use only what the order says; never add facts, citations or outcomes it does not contain. "
-    "Write 4 short labelled parts, about 150 words in total: Facts, Issue, Decision, Reasoning. "
-    "Name the provisions the decision turns on. Plain text, no markdown headings. "
-    "If the order is only a procedural or daily order (adjournment, listing, notice), say so in one sentence instead."
-)
-_client = None
-
-
-def summarize(rec, client=None):
-    """Our own summary of the order (never a publisher headnote). Returns None if the model declines."""
-    global _client
-    if client is None:
-        import anthropic
-        _client = _client or anthropic.Anthropic()  # key from ANTHROPIC_API_KEY or an `ant auth login` profile
-        client = _client
-    resp = client.beta.messages.create(
-        model=SUMMARY_MODEL,
-        max_tokens=4000,
-        output_config={"effort": "low"},  # a summary is a simple task; low effort keeps cost and time down
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",  # if the model declines, Anthropic re-runs it on a suitable fallback model
-        system=SUMMARY_SYSTEM,
-        messages=[{"role": "user", "content":
-                   f"Tribunal: {rec['tribunal_code']}\nCase: {rec.get('case_number')}\nDate: {rec.get('order_date')}\n\n"
-                   f"<order>\n{rec['full_text']}\n</order>"}],
-    )
-    if resp.stop_reason == "refusal":
-        print(f"  ! summary declined for {rec.get('case_number')}", file=sys.stderr)
-        return None
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    return text or None
 
 
 def _selftest():
@@ -216,9 +141,6 @@ def _selftest():
     nclt = {"tribunal_code": "NCLT", "parties": [{"role": "applicant", "name": "SBI"}, {"role": "respondent", "name": "X Ltd"}]}
     ex = extra_fields(nclt, t + " ... Hence the petition is admitted.", p)
     assert ex == {"ibc_section": "7", "corporate_debtor": "X Ltd", "outcome": "admitted"}, ex
-    itat = {"tribunal_code": "ITAT", "parties": [{"role": "appellant", "name": "DCIT, Circle 1(1)"}, {"role": "respondent", "name": "A"}]}
-    ex = extra_fields(itat, "ITA No. 1/Mum/2024 (A.Y. 2019-20) " + t, p)
-    assert ex == {"assessment_year": "2019-20", "appeal_by": "revenue", "section_in_dispute": "68"}, ex
 
 
 if __name__ == "__main__":

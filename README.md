@@ -2,7 +2,7 @@
 
 Collects Indian tribunal orders from free, official sources into one record format (see the "Tribunal Data Plan"):
 NCLAT judgments, NCLT insolvency orders (via IBBI's public list), TDSAT judgments, and CCI antitrust and merger orders.
-No paid APIs, no CAPTCHA bypass. Sites with a CAPTCHA (ITAT, CESTAT, NGT, DRT, CIC, e-Jagriti) or without a date list
+No paid APIs, no CAPTCHA bypass. Sites with a CAPTCHA (ITAT, CESTAT, NGT, DRT, SAT, CIC, e-Jagriti) or without a date list
 (CAT, APTEL) are not scraped.
 
 ## Setup (Windows)

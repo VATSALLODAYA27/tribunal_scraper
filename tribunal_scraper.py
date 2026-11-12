@@ -8,8 +8,8 @@ Sources (free, official):
   cci_antitrust    CCI antitrust orders (public JSON list)    (cci.gov.in/antitrust/orders)
   cci_combination  CCI merger (combination) orders            (cci.gov.in/combination/orders-section31)
 
-Not scraped on purpose: CAPTCHA on search: NCLT site, ITAT, CESTAT, NGT, DRT/DRAT, CIC, e-Jagriti (consumer).
-No date listing (case-number search only): CAT, APTEL. Site down when checked (12 Nov 2026): SAT.
+Not scraped on purpose (checked 12 Nov 2026): CAPTCHA on search: NCLT site, ITAT, CESTAT, NGT, DRT/DRAT, e-Jagriti (consumer),
+SAT (satweb.sat.gov.in), CIC (dss.cic.gov.in, which also encodes its data feed). No date listing: CAT, APTEL.
 
 Each order: text (PDF text, else OCR in English + Hindi), parsed fields, checks, masking, then enrich.py
 (acts and sections, citations, IBC fields). Everything runs free: no paid APIs.

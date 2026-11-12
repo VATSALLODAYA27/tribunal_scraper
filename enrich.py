@@ -58,7 +58,14 @@ def provisions(text):
         act = _act_name(m.group(2))
         if act:
             add(act, m.group(1))
-    return out
+    # "Indian Evidence Act" and "Indian Evidence Act, 1872" in one order are the same act: use the dated name
+    dated = {re.sub(r", \d{4}$", "", p["act"]): p["act"] for p in out if re.search(r", \d{4}$", p["act"])}
+    merged = []
+    for p in out:
+        p = {**p, "act": dated.get(p["act"], p["act"])}
+        if p not in merged:
+            merged.append(p)
+    return merged
 
 
 # ---------------- citations ----------------
@@ -137,6 +144,8 @@ def _selftest():
              "Sections 43, 45 or 66 of the Code. under Section 9 of The Insolvency & Bankruptcy Code, 2016 and Section 79(2) of the Income Tax Act, 1961.")
     assert provisions(noisy) == [{"act": IBC, "section": "31"}, {"act": IBC, "section": "9"},
                                  {"act": "Income-tax Act, 1961", "section": "79(2)"}], provisions(noisy)
+    assert provisions("Section 65B of the Indian Evidence Act, 1872 and Section 65B of the Indian Evidence Act.") == \
+        [{"act": "Indian Evidence Act, 1872", "section": "65B"}]
     assert citations(t) == ["(2019) 4 SCC 17", "AIR 1973 SC 1461", "[2020] 117 taxmann.com 23"], citations(t)
     nclt = {"tribunal_code": "NCLT", "parties": [{"role": "applicant", "name": "SBI"}, {"role": "respondent", "name": "X Ltd"}]}
     ex = extra_fields(nclt, t + " ... Hence the petition is admitted.", p)

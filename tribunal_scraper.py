@@ -2,10 +2,14 @@
 Tribunal order scraper (open sites only: no CAPTCHA, no login). Follows "Tribunal Data Plan" sections 4, 5, 7 and 8.
 
 Sources (free, official):
-  nclat      NCLAT judgments/orders, by order date   (nclat.nic.in/display-board/judge)
-  ibbi_nclt  NCLT IBC orders mirrored by IBBI        (ibbi.gov.in/en/orders/nclt)
+  nclat            NCLAT judgments/orders, by order date      (nclat.nic.in/display-board/judge)
+  ibbi_nclt        NCLT IBC orders mirrored by IBBI           (ibbi.gov.in/en/orders/nclt)
+  tdsat            TDSAT judgments, by order date             (tdsat.gov.in/Delhi/services/judgment.php)
+  cci_antitrust    CCI antitrust orders (public JSON list)    (cci.gov.in/antitrust/orders)
+  cci_combination  CCI merger (combination) orders            (cci.gov.in/combination/orders-section31)
 
-Not scraped on purpose: NCLT site, ITAT, CESTAT, NGT (CAPTCHA on search); APTEL site (diary-number search only).
+Not scraped on purpose: CAPTCHA on search: NCLT site, ITAT, CESTAT, NGT, DRT/DRAT, CIC, e-Jagriti (consumer).
+No date listing (case-number search only): CAT, APTEL. Site down when checked (12 Nov 2026): SAT.
 
 Each order: text (PDF text, else OCR in English + Hindi), parsed fields, checks, masking, then enrich.py
 (acts and sections, citations, IBC fields). Everything runs free: no paid APIs.
@@ -26,6 +30,7 @@ Usage:
 """
 import argparse, datetime as dt, hashlib, json, os, re, sys, time, unicodedata
 from collections import Counter
+from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
@@ -42,7 +47,8 @@ UA = "LawgicHubBot/0.1 (tribunal order indexing)"  # add a work contact address 
 DELAY = 3.0          # seconds between requests to the same site
 MAX_FAILS = 5        # consecutive failures before we stop hitting a site
 LOOKBACK_DAYS = 14   # sites upload orders ~a week late, so each run re-checks the last 2 weeks
-TRIBUNAL_START = {"NCLT": dt.date(2016, 6, 1), "NCLAT": dt.date(2016, 6, 1)}  # both constituted 1 June 2016
+TRIBUNAL_START = {"NCLT": dt.date(2016, 6, 1), "NCLAT": dt.date(2016, 6, 1),  # both constituted 1 June 2016
+                  "TDSAT": dt.date(2000, 1, 1), "CCI": dt.date(2009, 1, 1)}  # earliest possible order date (earlier = parse error)
 
 
 class SiteDown(Exception):
@@ -221,7 +227,7 @@ def validate(rec):
             flags.append("bad_order_date")
     if not rec.get("case_number_norm"):
         flags.append("case_number_unparsed")
-    if len(rec.get("parties") or []) < 2:
+    if len(rec.get("parties") or []) < 2 and rec.get("source", {}).get("name") != "cci_combination":  # mergers have no opponent
         flags.append("fewer_than_2_parties")
     text = rec.get("full_text") or ""
     if rec.get("text_method") == "needs_ocr":
@@ -359,12 +365,13 @@ NCLT_CITIES = {"new delhi": "New Delhi", "delhi": "New Delhi", "ahmedabad": "Ahm
 BENCH_CODES = {"ND": "New Delhi", "PB": "New Delhi", "AHM": "Ahmedabad", "ALD": "Allahabad", "AMR": "Amaravati",
                "BB": "Bengaluru", "CHD": "Chandigarh", "CHE": "Chennai", "CB": "Cuttack", "GB": "Guwahati",
                "HYD": "Hyderabad", "IND": "Indore", "JPR": "Jaipur", "KOB": "Kochi", "KB": "Kolkata", "MB": "Mumbai"}
-DESIG = re.compile(r"(?:Hon['’]?ble\s+)?(?:(Acting\s+)?President|Member\s*\(\s*(Judicial|Technical|J|T)\s*\))", re.I)
+# groups: acting, title (President / Chairperson), kind (Judicial / Technical); a bare "Member" (CCI) matches with all empty
+DESIG = re.compile(r"(?:Hon['’]?ble\s+)?(?:(Acting\s+)?(President|Chairperson|Chairman)|Member(?:\s*\(\s*(Judicial|Technical|J|T)\s*\)|(?![A-Za-z])))", re.I)
 CORAM_END = re.compile(r"^(appear|for\s|counsel|order|o r d e r|in the national|national company|present|date|pronounced|\[?per\b|\(heard|item|coram|an application)", re.I)
-MARKER = re.compile(r"(?:in\s*the\s*(?:original\s+)?matter\s*of|name\s+of\s+the\s+parties)\s*[:;]?\s*", re.I)
+MARKER = re.compile(r"(?:in\s*the\s*(?:original\s+)?matter\s*of|name\s+of\s+the\s+parties|^in\s+re\b)\s*[:;]?\s*", re.I)  # "In Re:" = CCI
 SEP = re.compile(r"^-*\s*(?:vs\.?|v/s\.?|versus|and)\s*-*$", re.I)  # "VS", "-VERSUS-", "And"
-NAME_STOP = re.compile(r"(…|\.\.\.|\bhaving\b|represented|registered|\bregd\b|\baddress|\(cin|\bcin\b|\bat[:\-])", re.I)
-ROLE_WORD = re.compile(r"(petitioner|applicant|appellant|intervenor|complainant|respondent|opposite party)", re.I)
+NAME_STOP = re.compile(r"(…|\.\.\.|\bhaving\b|represented|registered|\bregd\b|\baddress|\(cin|\bcin\b|\bat[:\-]|,?\s*\b[SDWR]/o\b)", re.I)  # S/o, D/o, W/o, R/o = son/daughter/wife of, resident of
+ROLE_WORD = re.compile(r"(petitioner|applicant|appellant|intervenor|complainant|informant|respondent|opposite party)", re.I)
 ROLE_ALIAS = re.compile(r"(personal guarantor|guarantor|(?:financial|operational)\s+creditor|creditor|corporate debtor|debtor|resolution professional)", re.I)
 NAME_END = re.compile(r"\b(limited|ltd\.?|llp|bank)\s*\.?$", re.I)
 
@@ -381,8 +388,9 @@ def members_from_coram(text):
             continue
         if CORAM_END.match(line):
             break
-        des = [("Acting President" if a else "President") if not k else ("Judicial Member" if k[0] in "Jj" else "Technical Member")
-               for a, k in DESIG.findall(line)]
+        des = [("Judicial Member" if k[0] in "Jj" else "Technical Member") if k else
+               (("Acting " if a else "") + t.title()) if t else "Member"
+               for a, t, k in DESIG.findall(line)]
         rest = re.sub(r"(?i)\bHon['’]?ble\b\.?", " ", DESIG.sub(" ", line))
         # titles (Shri, Ms. ...), commas and wide gaps separate names when two sit on one line
         names = [n.strip(" ,.;:") for n in re.split(r"(?i)\b(?:Shri|Sh|Smt|Ms|Mr|Mrs|Dr)\b\.?|\s{2,}|,", rest)]
@@ -421,7 +429,8 @@ def _role(lines, default):
     blob = " ".join(lines)
     m = ROLE_WORD.search(blob)
     if m:
-        return m.group(1).lower().replace(" ", "_")
+        role = m.group(1).lower().replace(" ", "_")
+        return "complainant" if role == "informant" else role  # CCI's informant is the complainant
     m = ROLE_ALIAS.search(blob)  # creditor / RP files the case, debtor / guarantor answers it
     if m:
         return "applicant" if re.search(r"creditor|professional", m.group(1), re.I) else "respondent"
@@ -431,7 +440,7 @@ def _role(lines, default):
 def _party_lines(lines):
     """Lines of one party after the separator, up to the next separator, marker or CORAM/appearance line."""
     out = []
-    for l in lines[:10]:
+    for l in lines[:14]:  # CCI lists a full address before the role line
         if out and (SEP.match(l) or MARKER.search(l) or CORAM_END.match(l)):
             break
         out.append(l)
@@ -480,8 +489,153 @@ def nclt_header(rec, text):
     return rec
 
 
-SOURCES = {"nclat": nclat_orders, "ibbi_nclt": ibbi_orders}
-SOURCE_TRIBUNAL = {"nclat": "NCLAT", "ibbi_nclt": "NCLT"}
+# ---------------- TDSAT (date-range search, direct PDF links) ----------------
+TDSAT = "https://tdsat.gov.in/Delhi/services/judgment.php"
+
+
+def tdsat_members(text):
+    """'MR. JUSTICE X(CHAIRPERSON), DR. Y(MEMBER),' -> [{'name': 'JUSTICE X', 'designation': 'Chairperson'}, ...]"""
+    return [{"name": re.sub(r"^(?:MR|MS|MRS|DR|SH|SHRI)\.?\s+", "", n.strip(" ,"), flags=re.I), "designation": d.strip().title()}
+            for n, d in re.findall(r"([^,()]+?)\s*\(([^)]+)\)", text) if n.strip(" ,")]
+
+
+def tdsat_orders(http, date_from, date_to):
+    start = date_from
+    while start <= date_to:  # one month per search keeps each result page small
+        end = min(date_to, (start.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1))
+        r = http.req("POST", TDSAT, data={"from_date1": start.strftime("%d/%m/%Y"), "to_date1": end.strftime("%d/%m/%Y"),
+                                          "frm3": "", "submit11": "Go"})  # site expects DD/MM/YYYY
+        soup = BeautifulSoup(r.text, "lxml")
+        for tr in soup.select("table tr"):
+            tds, a = tr.find_all("td"), tr.find("a", href=re.compile(r"\.pdf", re.I))
+            if len(tds) < 5 or not a:
+                continue
+            case_no, members, party, date = (tds[i].get_text(" ", strip=True) for i in (1, 2, 3, 4))
+            try:
+                d = dt.datetime.strptime(date, "%d-%m-%Y").date()
+            except ValueError as e:
+                yield {"_error": f"tdsat {case_no}: {e}"}
+                continue
+            parties = parties_from(party, "appellant", "respondent")
+            pdf_url = urljoin(TDSAT, a["href"])
+            yield {
+                "schema_version": SCHEMA_VERSION,
+                "tribunal_code": "TDSAT",
+                "bench": "New Delhi",
+                "case_number": case_no,
+                "case_number_norm": case_norm(case_no),
+                "case_type": case_no.split("/")[0].strip() or None,
+                "order_date": d.isoformat(),
+                "order_type": "final",  # judgments page lists final and oral (final) orders only
+                "title": title_from(parties) or party,
+                "parties": parties,
+                "members": tdsat_members(members),
+                "language": "en",
+                "source": {"name": "tdsat_site", "page_url": TDSAT, "pdf_url": pdf_url},
+                "_pdf": ("GET", pdf_url, None),
+            }
+        start = end + dt.timedelta(days=1)
+
+
+# ---------------- CCI (public JSON lists behind the order pages) ----------------
+CCI = "https://www.cci.gov.in/"
+
+
+def _cci_rows(http, path, page_size=50):
+    """All rows of a CCI DataTables list, newest first."""
+    for start in range(0, 100000, page_size):
+        rows = http.req("GET", CCI + path, params={"draw": 1, "start": start, "length": page_size},
+                        headers={"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}).json().get("data") or []
+        yield from rows
+        if len(rows) < page_size:
+            return
+
+
+def _cci_pdf(files_json):
+    """file_content is an HTML-escaped JSON list of {title, file_name}; prefer the one titled Order."""
+    files = json.loads(html_unescape(files_json or "null") or "null") or []
+    f = next((f for f in files if "order" in (f.get("title") or "").lower()), files[0] if files else None)
+    return urljoin(CCI, f["file_name"]) if f and f.get("file_name") else None
+
+
+def _cci_date(s):
+    return dt.datetime.strptime(s, "%d/%m/%Y").date() if s else None
+
+
+def cci_antitrust_orders(http, date_from, date_to):
+    older = 0
+    for row in _cci_rows(http, "antitrust/orders/list"):
+        try:
+            d = _cci_date(row.get("order_date") or row.get("main_order_date"))
+        except ValueError as e:
+            yield {"_error": f"cci {row.get('case_no')}: {e}"}
+            continue
+        if not d or not (date_from <= d <= date_to):
+            older = older + 1 if d and d < date_from else 0
+            if older >= 100:  # list is newest first: 100 older rows in a row = done
+                return
+            continue
+        older = 0
+        pdf_url = _cci_pdf(row.get("file_content"))
+        if not pdf_url:
+            continue
+        case_number = f"Case No. {row['case_no']}"
+        desc = html_unescape(row.get("description") or "").strip()
+        yield {
+            "schema_version": SCHEMA_VERSION,
+            "tribunal_code": "CCI",
+            "bench": "New Delhi",
+            "case_number": case_number,
+            "case_number_norm": case_norm(case_number),
+            "case_type": html_unescape(row.get("type") or "") or None,
+            "order_date": d.isoformat(),
+            "order_type": "final",
+            "title": desc if desc and desc.upper() != "XYZ" else case_number,  # "XYZ" = name withheld; parties come from the PDF
+            "parties": [],
+            "members": [],
+            "language": "en",
+            "source": {"name": "cci_antitrust", "page_url": CCI + "antitrust/orders", "pdf_url": pdf_url},
+            "_pdf": ("GET", pdf_url, None),
+        }
+
+
+def cci_combination_orders(http, date_from, date_to):
+    # whole list each run (~30 requests): an old notification can get its order today, so date order can't stop us early
+    for row in _cci_rows(http, "combination/orders-section31"):
+        pdf_url = _cci_pdf(row.get("order_file_content"))
+        if not pdf_url:
+            continue  # notices without an order
+        try:
+            d = _cci_date(row.get("date_of_order") or row.get("decision_date"))
+        except ValueError as e:
+            yield {"_error": f"cci combination {row.get('combination_no')}: {e}"}
+            continue
+        if not d or not (date_from <= d <= date_to):
+            continue
+        no = (row.get("combination_no") or "").strip()
+        name = re.sub(r"[​-‍﻿]", "", html_unescape(row.get("party_name") or row.get("description") or "")).strip()
+        yield {
+            "schema_version": SCHEMA_VERSION,
+            "tribunal_code": "CCI",
+            "bench": "New Delhi",
+            "case_number": no,
+            "case_number_norm": re.sub(r"\s+", "", no.upper()) or None,
+            "case_type": html_unescape(row.get("order_type") or "") or "Combination",
+            "order_date": d.isoformat(),
+            "order_type": "final",
+            "title": name or no,
+            "parties": [{"role": "applicant", "name": name}] if name else [],  # the notifying parties; mergers have no opponent
+            "members": [],
+            "language": "en",
+            "source": {"name": "cci_combination", "page_url": CCI + "combination/orders-section31", "pdf_url": pdf_url},
+            "_pdf": ("GET", pdf_url, None),
+        }
+
+
+SOURCES = {"nclat": nclat_orders, "ibbi_nclt": ibbi_orders, "tdsat": tdsat_orders,
+           "cci_antitrust": cci_antitrust_orders, "cci_combination": cci_combination_orders}
+SOURCE_TRIBUNAL = {"nclat": "NCLAT", "ibbi_nclt": "NCLT", "tdsat": "TDSAT", "cci_antitrust": "CCI", "cci_combination": "CCI"}
+HEADER_SOURCES = ("ibbi_nclt", "cci_antitrust")  # parties / members only in the PDF header
 
 
 # ---------------- PDF text + OCR ----------------
@@ -544,7 +698,7 @@ def save_order(http, rec, req, out, index, by_text, by_file):
     if not data.startswith(b"%PDF"):
         raise ValueError("download is not a PDF")
     text, pages, how = pdf_text(data)
-    if rec["tribunal_code"] == "NCLT":
+    if rec["source"]["name"] in HEADER_SOURCES:
         nclt_header(rec, text)  # before masking, so numbers in the header are intact
     text = mask(text)
     uid, sha = rec["order_uid"], hashlib.sha256(data).hexdigest()
@@ -617,7 +771,7 @@ def run(args):
                     if log["found"] == 1:  # prove download + text + checks once, in memory only
                         method, url, form = req
                         text, pages, how = pdf_text(http.req(method, url, data=form).content)
-                        if rec["tribunal_code"] == "NCLT":
+                        if rec["source"]["name"] in HEADER_SOURCES:
                             nclt_header(rec, text)
                         rec.update(full_text=mask(text), text_method=how, language=detect_language(text))
                         enrich.enrich(rec, text)
@@ -737,6 +891,23 @@ def _selftest():
     assert members_from_coram(split) == [{"name": "Prabhat Kumar", "designation": "Technical Member"},
                                          {"name": "Sushil Mahadeorao Kochey", "designation": "Judicial Member"}]
     assert parties_from_header("IA(IBC)/1683 of 2026\nAND\nIA(IBC)/100 of 2025\nORDER\n") == []  # "AND" between case numbers is not a party split
+    # TDSAT listing and CCI orders (formats seen Nov 2026)
+    assert tdsat_members("MR. JUSTICE DHIRUBHAI NARANBHAI PATEL(CHAIRPERSON), DR. SANJEEV BANZAL(MEMBER),") == [
+        {"name": "JUSTICE DHIRUBHAI NARANBHAI PATEL", "designation": "Chairperson"}, {"name": "SANJEEV BANZAL", "designation": "Member"}]
+    assert case_norm("AERA APPEAL/5/2021") == "AERAAPPEAL/5/2021" and case_norm("Case No. 02/2026") == "CASE/02/2026"
+    assert _cci_pdf(r'[{&quot;title&quot;:&quot;Order&quot;,&quot;file_name&quot;:&quot;images\/antitrustorder\/en\/order1.pdf&quot;}]') == \
+        "https://www.cci.gov.in/images/antitrustorder/en/order1.pdf"
+    assert _cci_pdf(None) is None
+    cci = ("Case No. 28 of 2026\n\nCOMPETITION COMMISSION OF INDIA\n\nIn Re:\n\nMrs. Bharti Sharma\nC-112, Shakti Nagar Extn.\n\nInformant\n\n"
+           "And\n\nMahindra & Mahindra Ltd.\nGateway Building, St.\nMumbai - 400001\n\nSri Durga Automobiles\n55-A, Rama Road,\n"
+           "Opposite Party No. 1/OP-1\n\nCORAM\n\nMs. Ravneet Kaur\nChairperson\n\nMs. Sweta Kakkad\nMember\n\nMr. Deepak Anurag\nMember\n\n"
+           "Order under Section 26(2) of the Competition Act, 2002\n")
+    assert parties_from_header(cci) == [{"role": "complainant", "name": "Mrs. Bharti Sharma"},
+                                        {"role": "opposite_party", "name": "Mahindra & Mahindra Ltd"}], parties_from_header(cci)
+    assert members_from_coram(cci) == [{"name": "Ravneet Kaur", "designation": "Chairperson"}, {"name": "Sweta Kakkad", "designation": "Member"},
+                                       {"name": "Deepak Anurag", "designation": "Member"}], members_from_coram(cci)
+    assert _party_name(["Bipin T. Alappat S/o Thomas AL, R/o Alappat House", "Informant"]) == "Bipin T. Alappat"
+    assert parties_from_header("In respect of the fees\nAND\nother things\n") == []  # "in re" only as a heading, not inside words
     ok = {"tribunal_code": "NCLAT", "case_number": "x", "case_number_norm": "IA/1/ND/2024", "order_date": "2026-11-03",
           "order_type": "final", "title": "A v. B", "parties": [1, 2], "full_text": "word " * 100, "text_method": "pdf_text", "language": "en"}
     assert validate(ok) == []

@@ -135,8 +135,17 @@ def case_norm(text):
 VS = re.compile(r"\s+(?:vs\.?|v/s\.?|versus|v\.)\s+", re.I)
 
 
+PARTY_CUT = re.compile(r"\s+(?:through|thr\.)\s.*$|,?\s*\b[SDWR]/o\b.*$", re.I)  # "X through its director", "Y W/o Z"
+
+
+def fix_c1(s):
+    """Some sites store Windows apostrophes/dashes as control characters (\\x92 ...): turn them back into the real character."""
+    return re.sub(r"[\x80-\x9f]", lambda m: m.group().encode("latin-1").decode("cp1252", "replace"), s)
+
+
 def parties_from(text, first, second):
-    names = [n.strip(" ,.") for n in VS.split(text or "", maxsplit=1) if n.strip(" ,.")]
+    names = [PARTY_CUT.sub("", fix_c1(n)).strip(" ,.") for n in VS.split(text or "", maxsplit=1)]
+    names = [n for n in names if n]
     if len(names) == 1:
         return [{"role": "other", "name": names[0]}]
     return [{"role": r, "name": n} for r, n in zip((first, second), names)]
@@ -146,16 +155,20 @@ def title_from(parties):
     return " v. ".join(p["name"] for p in parties[:2])
 
 
+MEMBER = re.compile(r"([^,()]+?)\s*\(((?:[^()]|\([^()]*\))*)\)")  # "name (designation)", designation may hold one inner bracket
+
+
 def members_from(coram):
+    """NCLAT coram: "Hon'ble Justice X (Member (Judicial)) , Mr. Y (Member (Technical)) ," -> list of name + designation."""
+    found = MEMBER.findall(coram or "") or [(n, None) for n in (coram or "").split(",")]  # no brackets: names only
     out = []
-    for part in re.split(r"\s*,\s*(?=Hon)", coram or ""):  # one member per "Hon'ble ..."
-        m = re.match(r"(?:Hon['’]?ble\s+)?(.*?)\s*\((.*)\)\s*$", part.strip())
-        name, des = (m.group(1), m.group(2)) if m else (re.sub(r"^Hon['’]?ble\s+", "", part.strip()), None)
+    for name, des in found:
+        name = re.sub(r"^Hon['’]?ble\s+", "", name.strip(" ,."))
         if des:
-            mm = re.fullmatch(r"Member\s*\(\s*(\w+)\s*\)", des)
-            des = f"{mm.group(1).title()} Member" if mm else des
+            mm = re.fullmatch(r"Member\s*\(\s*(\w+)\s*\)", des.strip())
+            des = f"{mm.group(1).title()} Member" if mm else des.strip()
         if name:
-            out.append({"name": name, "designation": des})
+            out.append({"name": name, "designation": des or None})
     return out
 
 
@@ -857,6 +870,13 @@ def _selftest():
     assert parties_from("X Pvt Ltd", "applicant", "respondent") == [{"role": "other", "name": "X Pvt Ltd"}]
     assert members_from("Hon'ble Justice N Sesha Sayee (Member(Judicial)) , Hon'ble Mr. Barun Mitra (Member (Technical))") == [
         {"name": "Justice N Sesha Sayee", "designation": "Judicial Member"}, {"name": "Mr. Barun Mitra", "designation": "Technical Member"}]
+    # seen in the 17 Nov dry run: third member without "Hon'ble", trailing comma
+    assert [m["name"] for m in members_from("Hon'ble Justice Yogesh Khanna (Member (Judicial)) , Hon'ble Mr. Barun Mitra (Member (Technical)) , "
+                                             "Mr. Ajai Das Mehrotra (Member (Technical)) ,")] == ["Justice Yogesh Khanna", "Mr. Barun Mitra", "Mr. Ajai Das Mehrotra"]
+    assert parties_from("UPSIDA THROUGH ITS CEO VS M/S BRYS HOTELS PVT LTD. THROUGH IT\x92S AUTHORISED REPRESENTATIVE", "appellant", "respondent") == [
+        {"role": "appellant", "name": "UPSIDA"}, {"role": "respondent", "name": "M/S BRYS HOTELS PVT LTD"}]
+    assert parties_from("KHUSHBU W/O JAMIEL FONSECA Through Power of Attorney VS Breakthrough Ltd", "appellant", "respondent")[0]["name"] == "KHUSHBU"
+    assert fix_c1("IT\x92S") == "IT’S"
     assert mask("PAN ABCDE1234F, Aadhaar 2345 6789 0123, ph 9876543210, A/c No. 123456789012, filing 9910101009462025") == \
         "PAN [PAN], Aadhaar [AADHAAR], ph [PHONE], A/c No. [ACCOUNT], filing 9910101009462025"
     pages = ["NCLAT\nCompany Appeal No. 1\nbody one\n1", "NCLAT\nCompany Appeal No. 1\nbody two\nPage 2 of 3", "NCLAT\nCompany Appeal No. 1\nbody three\n- 3 -"]
